@@ -590,9 +590,9 @@ async def process_redeem(call):
 async def start_bot4():
     """Alternative async startup function"""
     # You can create multiple bot instances like this
-    bot2_token = os.getenv("BOT2_TOKEN", API_TOKEN)  # Fallback to main token
+    bot4_token = os.getenv("BOT4_TOKEN", BOT4_TOKEN)  # Fallback to main token
     
-    if bot4_token == API_TOKEN:
+    if bot4_token == BOT4_TOKEN:
         print("⚠️ BOT2_TOKEN not set, using main token")
         return
     
@@ -625,3 +625,4 @@ async def main():
     
     # Start polling
     await bot.polling(non_stop=True)
+
