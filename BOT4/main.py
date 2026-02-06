@@ -1,533 +1,631 @@
+#!/usr/bin/env python3
+"""
+SHEIN REFER COUPON BOT
+Complete single file with MongoDB integration
+"""
+
 import os
-import random
-import asyncio
 import logging
-import pytz
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from motor.motor_asyncio import AsyncIOMotorClient
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+import asyncio
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Telegram imports
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove
+)
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
-    filters,
+    CallbackQueryHandler,
     ConversationHandler,
-    Application
+    ContextTypes,
+    filters
 )
 
-# ================= LOGGING SETUP =================
+# MongoDB imports
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
+
+# ================= CONFIGURATION =================
+# Load from environment variables
+BOT4_TOKEN = os.getenv("BOT4_TOKEN", "")
+MONGO_URI = os.getenv("MONGO_URI", "")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", 0))
+PORT = int(os.getenv("PORT", "8080"))
+
+# Multiple Admins and Force Subscribe Channels
+ADMIN_IDS = [5298223577, 2120581499]  # Add more admin IDs here
+FSUB_CHANNEL_IDS = [
+    -1002114224580,
+    -1003627956964,
+    -1003680807119,
+    -1002440964326,
+    -1003541438177
+]  # Force subscribe channels
+
+# Conversation states
+WAITING_CODES = 1
+
+# Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ================= CONFIGURATION =================
-BOT4_TOKEN = os.getenv("BOT4_TOKEN", "")
-MONGO_URI = os.getenv("MONGO_URI", "")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", ""))
-PORT = int(os.getenv("PORT", "8080"))
-
-# Multiple Admins and Force Subscribe Channels
-ADMIN_IDS = [5298223577,2120581499]  # Add more admin IDs here
-FSUB_CHANNEL_IDS = [-1002114224580,-1003627956964,-1003680807119,-1002440964326,-1003541438177]  # Add more channel IDs here
-
-# REMOVE WELCOME IMAGE - TEMPORARY
-# WELCOME_IMAGE = ""  # Image removed
-DEV_CREDITS = "\n\n👨‍💻 *Developed by:* [VoidXdevs](https://t.me/devXvoid)"
-
-# ================= MONGODB SETUP =================
-client = AsyncIOMotorClient(MONGO_URI)
-db = client.shein_coupon_bot
-
-# Collections
-users_collection = db.users
-coupons_collection = db.coupons
-backup_logs_collection = db.backup_logs
-
-# Global Memory
-user_captcha = {}
-pending_referrals = {}
-processing_users = []
-channel_invite_links = {}  # Store generated invite links
-
-# IST Time Helper
-def get_ist_time():
-    IST = pytz.timezone('Asia/Kolkata')
-    return datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-
-# ================= MONGODB FUNCTIONS =================
-async def get_user_data(user_id: int):
-    user = await users_collection.find_one({"user_id": user_id})
-    return user
-
-async def update_user_balance(user_id: int, amount: int):
-    await users_collection.update_one(
-        {"user_id": user_id},
-        {"$inc": {"balance": amount}},
-        upsert=True
-    )
-
-async def register_user_mongo(user_id: int, first_name: str, referrer_id: Optional[int] = None):
-    existing_user = await get_user_data(user_id)
-    if not existing_user:
+# ================= DATABASE SETUP =================
+class Database:
+    def __init__(self):
+        self.client = None
+        self.db = None
+        self.connect()
+    
+    def connect(self):
+        """Connect to MongoDB"""
+        try:
+            self.client = MongoClient(MONGO_URI)
+            self.db = self.client.shein_bot
+            # Create collections if not exists
+            self.db.users.create_index("user_id", unique=True)
+            self.db.coupons.create_index("code", unique=True)
+            self.db.redeemed.create_index([("user_id", 1), ("code", 1)], unique=True)
+            self.db.admin_logs.create_index("timestamp")
+            logger.info("✅ Connected to MongoDB")
+        except ConnectionFailure as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
+            raise
+    
+    # ========== USER MANAGEMENT ==========
+    def get_user(self, user_id: int):
+        """Get user data"""
+        return self.db.users.find_one({"user_id": user_id})
+    
+    def create_user(self, user_id: int, username: str, first_name: str, last_name: str = ""):
+        """Create new user"""
         user_data = {
             "user_id": user_id,
+            "username": username,
             "first_name": first_name,
-            "balance": 0,
-            "referrer_id": referrer_id,
-            "joined_date": datetime.now().strftime("%Y-%m-%d"),
-            "created_at": datetime.now()
+            "last_name": last_name,
+            "balance": 0.0,
+            "referral_count": 0,
+            "referral_code": str(uuid4())[:8],
+            "created_at": datetime.now(),
+            "last_active": datetime.now(),
+            "is_banned": False
         }
-        await users_collection.insert_one(user_data)
-        return True
-    return False
-
-async def get_stock_count(category: str):
-    pipeline = [
-        {"$match": {"category": category, "status": "unused"}},
-        {"$count": "count"}
-    ]
-    result = await coupons_collection.aggregate(pipeline).to_list(length=1)
-    return result[0]["count"] if result else 0
-
-async def add_coupons_mongo(category: str, codes_list: List[str]):
-    added = 0
-    for code in codes_list:
-        if code:
-            existing = await coupons_collection.find_one({
-                "category": category,
-                "code": code
-            })
-            if not existing:
-                coupon_data = {
-                    "category": category,
-                    "code": code,
-                    "status": "unused",
-                    "used_by": None,
-                    "used_at": None,
-                    "created_at": datetime.now()
-                }
-                await coupons_collection.insert_one(coupon_data)
-                added += 1
-    return added
-
-async def redeem_coupon_mongo(category: str, user_id: int, cost: int):
-    # Find an unused coupon
-    coupon = await coupons_collection.find_one_and_update(
-        {"category": category, "status": "unused"},
-        {"$set": {"status": "used", "used_by": user_id, "used_at": datetime.now()}},
-        sort=[("created_at", 1)]  # Get oldest first
-    )
+        self.db.users.insert_one(user_data)
+        return user_data
     
-    if coupon:
-        # Update user balance
-        await users_collection.update_one(
+    def update_user_activity(self, user_id: int):
+        """Update user's last active time"""
+        self.db.users.update_one(
             {"user_id": user_id},
-            {"$inc": {"balance": -cost}}
+            {"$set": {"last_active": datetime.now()}}
         )
-        return coupon["code"]
-    return None
-
-# ================= BACKUP SYSTEM =================
-async def backup_job():
-    while True:
-        await asyncio.sleep(7200)  # Every 2 hours
-        try:
-            # Export collections to JSON-like format
-            users = await users_collection.find().to_list(length=None)
-            coupons = await coupons_collection.find().to_list(length=None)
+    
+    def increment_balance(self, user_id: int, amount: float):
+        """Increase user balance"""
+        self.db.users.update_one(
+            {"user_id": user_id},
+            {"$inc": {"balance": amount}}
+        )
+    
+    def get_user_balance(self, user_id: int):
+        """Get user balance"""
+        user = self.get_user(user_id)
+        return user.get("balance", 0.0) if user else 0.0
+    
+    # ========== COUPON MANAGEMENT ==========
+    def get_coupon_stock(self):
+        """Get current coupon stock"""
+        stock = {
+            "500": 0,
+            "1000": 0,
+            "2000": 0,
+            "4000": 0
+        }
+        
+        coupons = self.db.coupons.find({"is_used": False})
+        for coupon in coupons:
+            amount = str(coupon.get("amount", 0))
+            if amount in stock:
+                stock[amount] += 1
+        
+        return stock
+    
+    def add_coupons(self, amount: int, codes: List[str]):
+        """Add new coupon codes to database"""
+        added = 0
+        for code in codes:
+            code = code.strip()
+            if not code:
+                continue
             
-            backup_data = {
-                "timestamp": datetime.now(),
-                "ist_time": get_ist_time(),
-                "users_count": len(users),
-                "coupons_count": len(coupons),
-                "users_sample": users[:10] if users else [],
-                "coupons_sample": coupons[:10] if coupons else []
+            coupon_data = {
+                "code": code,
+                "amount": amount,
+                "is_used": False,
+                "added_at": datetime.now(),
+                "used_by": None,
+                "used_at": None
             }
             
-            # Save to backup collection
-            await backup_logs_collection.insert_one(backup_data)
-            
-            # Send log to channel
-            from telegram.constants import ParseMode
-            app = Application.builder().token(BOT4_TOKEN).build()
-            await app.initialize()
-            
-            backup_msg = (
-                "🗂 **System Auto Backup (MongoDB)**\n"
-                f"📅 Time (IST): {get_ist_time()}\n"
-                f"👥 Total Users: {len(users)}\n"
-                f"🎟 Total Coupons: {len(coupons)}\n"
-                f"🤖 Bot: @{(await app.bot.get_me()).username}"
-            )
-            
-            await app.bot.send_message(
-                LOG_CHANNEL_ID, 
-                backup_msg, 
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            await app.shutdown()
-            print(f"✅ Backup completed at {get_ist_time()}")
-            
-        except Exception as e:
-            print(f"❌ Backup Failed: {e}")
+            try:
+                self.db.coupons.insert_one(coupon_data)
+                added += 1
+            except:
+                continue
+        
+        return added
+    
+    def get_available_coupon(self, amount: int):
+        """Get an available coupon of specific amount"""
+        return self.db.coupons.find_one({
+            "amount": amount,
+            "is_used": False
+        })
+    
+    def mark_coupon_used(self, code: str, user_id: int):
+        """Mark coupon as used"""
+        result = self.db.coupons.update_one(
+            {"code": code, "is_used": False},
+            {
+                "$set": {
+                    "is_used": True,
+                    "used_by": user_id,
+                    "used_at": datetime.now()
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            # Record redemption
+            self.db.redeemed.insert_one({
+                "user_id": user_id,
+                "code": code,
+                "redeemed_at": datetime.now()
+            })
+            return True
+        return False
+    
+    # ========== REDEMPTION HISTORY ==========
+    def get_user_redemptions(self, user_id: int):
+        """Get user's redemption history"""
+        return list(self.db.redeemed.find({"user_id": user_id}).sort("redeemed_at", -1))
+    
+    def get_redemption_count(self, user_id: int):
+        """Get user's redemption count"""
+        return self.db.redeemed.count_documents({"user_id": user_id})
+    
+    # ========== ADMIN LOGS ==========
+    def log_admin_action(self, admin_id: int, action: str, details: str = ""):
+        """Log admin actions"""
+        self.db.admin_logs.insert_one({
+            "admin_id": admin_id,
+            "action": action,
+            "details": details,
+            "timestamp": datetime.now()
+        })
+    
+    def get_stats(self):
+        """Get bot statistics"""
+        total_users = self.db.users.count_documents({})
+        active_today = self.db.users.count_documents({
+            "last_active": {"$gte": datetime.now().replace(hour=0, minute=0, second=0)}
+        })
+        total_coupons = self.db.coupons.count_documents({})
+        used_coupons = self.db.coupons.count_documents({"is_used": True})
+        
+        return {
+            "total_users": total_users,
+            "active_today": active_today,
+            "total_coupons": total_coupons,
+            "used_coupons": used_coupons,
+            "available_coupons": total_coupons - used_coupons
+        }
+
+# Initialize database
+db = Database()
 
 # ================= HELPER FUNCTIONS =================
-async def get_or_create_invite_link(chat_id: int, app: Application):
-    """Create or get invite link for channel"""
-    if chat_id in channel_invite_links:
-        return channel_invite_links[chat_id]
-    
+async def send_log_message(context: ContextTypes.DEFAULT_TYPE, message: str):
+    """Send message to log channel"""
     try:
-        # Try to create new invite link
-        invite_link = await app.bot.create_chat_invite_link(
-            chat_id=chat_id,
-            member_limit=1,  # Single use link for security
-            creates_join_request=False
+        await context.bot.send_message(
+            chat_id=LOG_CHANNEL_ID,
+            text=message,
+            parse_mode="HTML"
         )
-        link = invite_link.invite_link
-        channel_invite_links[chat_id] = link
-        return link
     except Exception as e:
-        logger.error(f"Error creating invite link for {chat_id}: {e}")
-        
-        # Fallback: try to get existing invite link
-        try:
-            chat = await app.bot.get_chat(chat_id)
-            if chat.invite_link:
-                link = chat.invite_link
-                channel_invite_links[chat_id] = link
-                return link
-            else:
-                # Generate public link format
-                if str(chat_id).startswith("-100"):
-                    link = f"https://t.me/c/{str(chat_id)[4:]}"
-                else:
-                    link = f"https://t.me/{chat.username}" if chat.username else f"https://t.me/{chat_id}"
-                channel_invite_links[chat_id] = link
-                return link
-        except Exception as e2:
-            logger.error(f"Fallback also failed for {chat_id}: {e2}")
-            return f"https://t.me/{chat_id}"
+        logger.error(f"Failed to send log message: {e}")
 
-async def is_joined(user_id: int, app: Application):
-    """Check if user has joined all required channels"""
-    try:
-        for chat_id in FSUB_CHANNEL_IDS:
-            try:
-                member = await app.bot.get_chat_member(chat_id, user_id)
-                if member.status not in ['creator', 'administrator', 'member']:
-                    return False
-            except Exception as e:
-                logger.error(f"Error checking membership for {chat_id}: {e}")
-                # If bot can't check (no permission), assume user needs to join
-                return False
+async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if user is subscribed to all required channels"""
+    if not FSUB_CHANNEL_IDS:
         return True
-    except Exception as e:
-        logger.error(f"Error checking membership: {e}")
-        return False
-
-async def send_log(log_type: str, user_id: int, first_name: str, app: Application, details: str = ""):
-    try:
-        user_link = f"[{first_name}](tg://user?id={user_id})"
-        time_now = get_ist_time()
-        
-        if log_type == "new_user":
-            msg = (
-                "#NewUser Joined 🚀\n\n"
-                f"👤 Name: {user_link}\n"
-                f"🆔 ID: `{user_id}`\n"
-                f"🕒 Time: `{time_now}`\n"
-                f"🤖 Bot: @{(await app.bot.get_me()).username}"
-            )
-        elif log_type == "withdraw":
-            msg = (
-                "#NewWithdraw Request 💸\n\n"
-                f"👤 User: {user_link}\n"
-                f"🆔 ID: `{user_id}`\n"
-                f"{details}\n"
-                f"🕒 Time: `{time_now}`\n"
-                f"🤖 Bot: @{(await app.bot.get_me()).username}"
-            )
-        
-        await app.bot.send_message(
-            LOG_CHANNEL_ID,
-            msg,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Log Error: {e}")
-
-# ================= COMMAND HANDLERS =================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    first_name = update.effective_user.first_name
     
-    # Check Force Subscribe
-    if not await is_joined(user_id, context.application):
+    for channel_id in FSUB_CHANNEL_IDS:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if member.status in ['left', 'kicked']:
+                return False
+        except Exception as e:
+            logger.error(f"Error checking subscription for channel {channel_id}: {e}")
+            return False
+    
+    return True
+
+def get_main_keyboard():
+    """Get main reply keyboard"""
+    keyboard = [
+        ["🔗 My Link", "💎 Balance"],
+        ["🎟 Coupon Stock", "💸 Withdraw"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_admin_keyboard():
+    """Get admin keyboard"""
+    keyboard = [
+        ["👑 Admin Panel"],
+        ["🔗 My Link", "💎 Balance"],
+        ["🎟 Coupon Stock", "💸 Withdraw"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def format_stock_message(stock):
+    """Format stock message"""
+    return (
+        "🎟 <b>Coupon Stock</b>\n\n"
+        f"• 500 Coupons: {stock['500']}\n"
+        f"• 1000 Coupons: {stock['1000']}\n"
+        f"• 2000 Coupons: {stock['2000']}\n"
+        f"• 4000 Coupons: {stock['4000']}"
+    )
+
+# ================= BOT HANDLERS =================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Check if user exists
+    user_data = db.get_user(user_id)
+    if not user_data:
+        # Create new user
+        user_data = db.create_user(
+            user_id=user_id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name or ""
+        )
+        
+        # Send new user notification to log channel
+        log_message = (
+            "#NewUser Joined 🚀\n\n"
+            f"👤 Name: {user.first_name}\n"
+            f"🆔 ID: {user_id}\n"
+            f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+        )
+        await send_log_message(context, log_message)
+    
+    # Update activity
+    db.update_user_activity(user_id)
+    
+    # Check subscription
+    is_subscribed = await check_user_subscription(user_id, context)
+    
+    if not is_subscribed:
+        # Create channel list message
+        channels_text = "\n".join([f"• Channel {i+1}" for i in range(len(FSUB_CHANNEL_IDS))])
+        
+        # Create inline keyboard with channel links
         keyboard = []
-        for i, chat_id in enumerate(FSUB_CHANNEL_IDS, 1):
-            link = await get_or_create_invite_link(chat_id, context.application)
-            keyboard.append([InlineKeyboardButton(f"📢 Join Channel {i}", url=link)])
+        for i, channel_id in enumerate(FSUB_CHANNEL_IDS):
+            try:
+                chat = await context.bot.get_chat(channel_id)
+                keyboard.append([InlineKeyboardButton(
+                    f"📢 Join Channel {i+1}", 
+                    url=f"https://t.me/{chat.username}" if chat.username else f"https://t.me/c/{str(chat.id)[4:]}"
+                )])
+            except:
+                continue
         
-        keyboard.append([InlineKeyboardButton("✅ I've Joined All", callback_data="check_join")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        keyboard.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
         
         await update.message.reply_text(
-            "⚠️ **Action Required**\n\nTo use this bot, you must join all our channels. Click the buttons below to join:",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
+            "⚠️ <b>Please join our channels to use the bot!</b>\n\n"
+            f"{channels_text}\n\n"
+            "After joining, click the button below:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-
-    # Check if existing user
-    user_data = await get_user_data(user_id)
-    if user_data:
-        keyboard = [
-            ["🔗 My Link", "💎 Balance"],
-            ["💸 Withdraw", "🎟 Coupon Stock"]
-        ]
-        reply_markup = {
-            "keyboard": keyboard,
-            "resize_keyboard": True,
-            "one_time_keyboard": False
-        }
-        await update.message.reply_text(
-            "👇 Select option",
-            reply_markup=reply_markup
-        )
-        return
-
-    # Referral Logic
-    args = context.args
-    if args:
-        referrer = args[0]
-        if referrer.isdigit() and int(referrer) != user_id:
-            pending_referrals[user_id] = int(referrer)
-
-    # Captcha
-    n1, n2 = random.randint(1, 9), random.randint(1, 9)
-    user_captcha[user_id] = n1 + n2
+    
+    # Send welcome message
+    if user_id in ADMIN_IDS:
+        reply_markup = get_admin_keyboard()
+    else:
+        reply_markup = get_main_keyboard()
     
     await update.message.reply_text(
-        f"🔒 *CAPTCHA*\n{n1} + {n2} = ??\n\nSend answer to verify.",
-        parse_mode="Markdown"
+        "🤖 <b>Welcome to SHEIN REFER COUPON BOT!</b>\n\n"
+        "🛍️ Buy Fast Now, Buy Discount\n"
+        "🎁 Great Offers and Discounts\n"
+        "🚀 Order Now\n"
+        "💰 Avail Cash on Delivery\n"
+        "🔄 Easy Returns and Exchange\n\n"
+        "<i>Use the buttons below to navigate:</i>",
+        parse_mode="HTML",
+        reply_markup=reply_markup
     )
 
 async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle join check callback"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
-    if await is_joined(user_id, context.application):
-        await query.message.delete()
-        await start_command(update, context)
-    else:
-        await query.answer("❌ You haven't joined all channels! Please join all channels first.", show_alert=True)
-
-async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    first_name = update.effective_user.first_name
     
-    if user_id not in user_captcha:
-        return
+    # Check subscription again
+    is_subscribed = await check_user_subscription(user_id, context)
     
-    try:
-        answer = int(update.message.text)
-        if answer == user_captcha[user_id]:
-            del user_captcha[user_id]
-            await update.message.reply_text("✅ Correct answer!")
-            
-            # Register user
-            referrer_id = pending_referrals.get(user_id)
-            is_new = await register_user_mongo(user_id, first_name, referrer_id)
-            
-            if is_new:
-                await send_log("new_user", user_id, first_name, context.application)
-                
-                # Give referral reward
-                if referrer_id:
-                    await update_user_balance(referrer_id, 1)
-                    try:
-                        await context.bot.send_message(
-                            referrer_id,
-                            "🎉 New Referral! You got +1 💎 Diamond."
-                        )
-                    except:
-                        pass
-            
-            # Welcome message (NO IMAGE - TEXT ONLY)
-            caption = (
-                "👋 Welcome to SHEIN Refer Coupon Bot!\n"
-                "Invite friends & earn rewards.\n\n"
-                "👇 Select option from menu"
-            )
-            
-            await update.message.reply_text(
-                caption,
-                parse_mode="Markdown"
-            )
-            
-            # Show main menu
-            keyboard = [
-                ["🔗 My Link", "💎 Balance"],
-                ["💸 Withdraw", "🎟 Coupon Stock"]
-            ]
-            reply_markup = {
-                "keyboard": keyboard,
-                "resize_keyboard": True,
-                "one_time_keyboard": False
-            }
-            await update.message.reply_text(
-                "👇 Select option",
-                reply_markup=reply_markup
-            )
+    if is_subscribed:
+        if user_id in ADMIN_IDS:
+            reply_markup = get_admin_keyboard()
         else:
-            await update.message.reply_text("❌ Wrong answer. Try again.")
-    except ValueError:
-        await update.message.reply_text("Please send a number.")
+            reply_markup = get_main_keyboard()
+        
+        await query.edit_message_text(
+            "✅ <b>Channel verified!</b>\n\n"
+            "Now you can use all features of the bot.",
+            parse_mode="HTML"
+        )
+        
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🤖 <b>Welcome to SHEIN REFER COUPON BOT!</b>\n\n"
+                 "Use the buttons below to navigate:",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    else:
+        await query.answer("❌ Please join all channels first!", show_alert=True)
 
 async def handle_my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    bot_username = (await context.bot.get_me()).username
-    link = f"https://t.me/{bot_username}?start={user_id}"
+    """Handle My Link button"""
+    user = update.effective_user
+    user_data = db.get_user(user.id)
     
-    text = (
-        "🔗 *Your Referral Link*\n"
-        f"`{link}`\n"
-        f"Get 1 💎 for every verified join."
+    if not user_data:
+        await update.message.reply_text("❌ User not found. Please use /start first.")
+        return
+    
+    referral_code = user_data.get("referral_code", str(uuid4())[:8])
+    bot_username = (await context.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+    
+    message = (
+        "🔗 <b>Your Referral Link</b>\n\n"
+        f"{referral_link}\n\n"
+        "🎉 <b>Invite friends & earn rewards</b>\n"
+        "Get 1 ❤️ for every verified join\n\n"
+        "<i>Share this link to start earning!</i>"
     )
     
-    keyboard = [[InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={link}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [
+        [InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={referral_link}&text=Get%20FREE%20SHEIN%20Coupons%20🎁")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+    ]
     
     await update.message.reply_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        message,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
     )
 
 async def handle_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Balance button"""
     user_id = update.effective_user.id
-    user_data = await get_user_data(user_id)
-    balance = user_data["balance"] if user_data else 0
+    user_data = db.get_user(user_id)
     
-    await update.message.reply_text(
-        f"💎 *Balance*\nTotal: {balance}.0 💎",
-        parse_mode="Markdown"
+    if not user_data:
+        await update.message.reply_text("❌ User not found. Please use /start first.")
+        return
+    
+    balance = user_data.get("balance", 0.0)
+    redemption_count = db.get_redemption_count(user_id)
+    
+    message = (
+        "💎 <b>Balance</b>\n\n"
+        f"<b>Total:</b> {balance:.1f} 💎\n"
+        f"<b>Redeem:</b> {redemption_count}\n\n"
+        "<i>Redeem History:</i>"
     )
+    
+    # Get recent redemptions
+    redemptions = db.get_user_redemptions(user_id)[:5]  # Last 5 redemptions
+    
+    if redemptions:
+        for i, redemption in enumerate(redemptions, 1):
+            code = redemption.get("code", "N/A")
+            time = redemption.get("redeemed_at", datetime.now()).strftime("%Y-%m-%d %H:%M")
+            message += f"\n{i}. {code} - {time}"
+    else:
+        message += "\nNo redemptions yet."
+    
+    await update.message.reply_text(message, parse_mode="HTML")
 
 async def handle_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stock_500 = await get_stock_count("500")
-    stock_1000 = await get_stock_count("1000")
-    stock_2000 = await get_stock_count("2000")
-    stock_4000 = await get_stock_count("4000")
+    """Handle Coupon Stock button"""
+    stock = db.get_coupon_stock()
     
-    text = (
-        "🎟 *Live Coupon Stock*\n\n"
-        f"📦 500: {stock_500}\n"
-        f"📦 1000: {stock_1000}\n"
-        f"📦 2000: {stock_2000}\n"
-        f"📦 4000: {stock_4000}"
-    )
-    
-    await update.message.reply_text(text, parse_mode="Markdown")
+    message = format_stock_message(stock)
+    await update.message.reply_text(message, parse_mode="HTML")
 
 async def handle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Withdraw button"""
     user_id = update.effective_user.id
-    user_data = await get_user_data(user_id)
-    balance = user_data["balance"] if user_data else 0
+    balance = db.get_user_balance(user_id)
     
-    text = f"💸 *Withdraw*\nTotal Balance: {balance}.0 💎\nSelect amount to withdraw:"
+    if balance <= 0:
+        await update.message.reply_text(
+            "❌ <b>Insufficient Balance!</b>\n\n"
+            "Your balance is 0.0 💎\n"
+            "Invite friends to earn more coins.",
+            parse_mode="HTML"
+        )
+        return
     
+    # Show withdrawal options
     keyboard = [
         [
-            InlineKeyboardButton("1 💎 500 🎟", callback_data="redeem_500_1"),
-            InlineKeyboardButton("4 💎 1000 🎟", callback_data="redeem_1000_4")
+            InlineKeyboardButton("1 💎 = 500 ₪", callback_data="redeem_500"),
+            InlineKeyboardButton("4 💎 = 1000 ₪", callback_data="redeem_1000")
         ],
         [
-            InlineKeyboardButton("15 💎 2000 🎟", callback_data="redeem_2000_15"),
-            InlineKeyboardButton("25 💎 4000 🎟", callback_data="redeem_4000_25")
-        ]
+            InlineKeyboardButton("15 💎 = 2000 ₪", callback_data="redeem_2000"),
+            InlineKeyboardButton("25 💎 = 4000 ₪", callback_data="redeem_4000")
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = (
+        "💸 <b>Withdraw</b>\n\n"
+        f"<b>Total Balance:</b> {balance:.1f} 💎\n"
+        "<b>Select amount to withdraw:</b>"
+    )
     
     await update.message.reply_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        message,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def handle_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle redeem callback"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
-    first_name = query.from_user.first_name
+    data = query.data
+    amount_map = {
+        "redeem_500": 500,
+        "redeem_1000": 1000,
+        "redeem_2000": 2000,
+        "redeem_4000": 4000
+    }
     
-    if user_id in processing_users:
-        await query.answer("⏳ Processing... Please wait.", show_alert=True)
+    amount = amount_map.get(data)
+    if not amount:
         return
     
-    processing_users.append(user_id)
+    # Check user balance
+    balance = db.get_user_balance(user_id)
+    cost_map = {500: 1, 1000: 4, 2000: 15, 4000: 25}
+    cost = cost_map.get(amount, 1)
     
-    try:
-        data = query.data.split("_")
-        category = data[1]
-        cost = int(data[2])
+    if balance < cost:
+        await query.edit_message_text(
+            f"❌ <b>Insufficient Balance!</b>\n\n"
+            f"Required: {cost} 💎\n"
+            f"Your balance: {balance:.1f} 💎\n\n"
+            "Invite friends to earn more coins.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Get available coupon
+    coupon = db.get_available_coupon(amount)
+    
+    if not coupon:
+        await query.edit_message_text(
+            f"❌ <b>Coupon Out of Stock!</b>\n\n"
+            f"{amount} ₪ coupons are currently unavailable.\n"
+            "Please try again later or choose different amount.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Mark coupon as used and deduct balance
+    if db.mark_coupon_used(coupon["code"], user_id):
+        db.increment_balance(user_id, -cost)
         
-        # Check balance
-        user_data = await get_user_data(user_id)
-        if not user_data or user_data["balance"] < cost:
-            await query.answer("❌ Not enough diamonds!", show_alert=True)
-            return
+        # Send success message
+        await query.edit_message_text(
+            f"✅ <b>Coupon Redeemed Successfully!</b>\n\n"
+            f"🎟 <b>Code:</b> <code>{coupon['code']}</code>\n"
+            f"💰 <b>Amount:</b> {amount} ₪\n"
+            f"💸 <b>Deducted:</b> {cost} 💎\n"
+            f"💎 <b>Remaining Balance:</b> {balance - cost:.1f} 💎\n\n"
+            "<i>Use this code on SHEIN app/website</i>",
+            parse_mode="HTML"
+        )
         
-        # Check stock
-        stock_count = await get_stock_count(category)
-        if stock_count == 0:
-            await query.answer("⚠️ Out of Stock! Contact Admin.", show_alert=True)
-            return
-        
-        # Redeem coupon
-        coupon_code = await redeem_coupon_mongo(category, user_id, cost)
-        
-        if coupon_code:
-            # Send coupon to user (ONLY HERE ADD DEV CREDITS)
-            msg = (
-                "✅ *Redemption Successful!*\n\n"
-                f"🎟 Category: {category} Coupons\n"
-                f"🔐 Code: `{coupon_code}`\n\n"
-                "⚠️ Copy and use it immediately!"
-                f"{DEV_CREDITS}"
-            )
-            await query.message.reply_text(msg, parse_mode="Markdown")
-            
-            # Log
-            details = f"🎟 Type: {category} Coupon\n💎 Cost: {cost} Diamonds"
-            await send_log("withdraw", user_id, first_name, context.application, details)
-        else:
-            await query.answer("❌ Error redeeming coupon!", show_alert=True)
-            
-    except Exception as e:
-        logger.error(f"Redeem error: {e}")
-        await query.message.reply_text("❌ Error occurred. Contact Admin.")
-    finally:
-        if user_id in processing_users:
-            processing_users.remove(user_id)
+        # Log the redemption
+        log_message = (
+            f"🎟 <b>New Redemption</b>\n\n"
+            f"👤 User: {query.from_user.first_name} (ID: {user_id})\n"
+            f"💰 Amount: {amount} ₪\n"
+            f"🔢 Code: {coupon['code']}\n"
+            f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+        )
+        await send_log_message(context, log_message)
+    else:
+        await query.edit_message_text(
+            "❌ <b>Error processing coupon!</b>\n\n"
+            "Please try again later.",
+            parse_mode="HTML"
+        )
+
+async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle back to main callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    if user_id in ADMIN_IDS:
+        reply_markup = get_admin_keyboard()
+    else:
+        reply_markup = get_main_keyboard()
+    
+    await query.edit_message_text(
+        "🤖 <b>Main Menu</b>\n\n"
+        "Use the buttons below to navigate:",
+        parse_mode="HTML"
+    )
+    
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="⬇️ <b>Navigation Menu</b>",
+        parse_mode="HTML",
+        reply_markup=reply_markup
+    )
 
 # ================= ADMIN HANDLERS =================
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /admin command"""
     user_id = update.effective_user.id
+    
     if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Access denied!")
         return
     
+    # Admin panel keyboard
     keyboard = [
         [
             InlineKeyboardButton("➕ Add 500 Coupons", callback_data="admin_add_500"),
@@ -538,146 +636,186 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("➕ Add 4000 Coupons", callback_data="admin_add_4000")
         ],
         [
-            InlineKeyboardButton("📊 View Stats", callback_data="admin_stats"),
+            InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
             InlineKeyboardButton("🔄 Reload Data", callback_data="admin_reload")
-        ]
+        ],
+        [InlineKeyboardButton("🔙 Back to Main", callback_data="back_to_main")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    stats = db.get_stats()
+    
+    message = (
+        "👑 <b>Admin Panel</b>\n\n"
+        f"👥 <b>Total Users:</b> {stats['total_users']}\n"
+        f"🟢 <b>Active Today:</b> {stats['active_today']}\n"
+        f"🎟 <b>Total Coupons:</b> {stats['total_coupons']}\n"
+        f"✅ <b>Used Coupons:</b> {stats['used_coupons']}\n"
+        f"🔄 <b>Available:</b> {stats['available_coupons']}\n\n"
+        "<i>Select an option:</i>"
+    )
     
     await update.message.reply_text(
-        "👨‍💻 **Admin Panel**\nSelect option:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        message,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def admin_add_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin add coupons callback"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
     if user_id not in ADMIN_IDS:
-        await query.answer("❌ Unauthorized!", show_alert=True)
+        await query.edit_message_text("❌ Access denied!")
         return
     
-    category = query.data.split("_")[2]  # admin_add_500 -> 500
+    # Get amount from callback data
+    data = query.data
+    amount_map = {
+        "admin_add_500": 500,
+        "admin_add_1000": 1000,
+        "admin_add_2000": 2000,
+        "admin_add_4000": 4000
+    }
     
-    # Store category in context for next step
-    context.user_data["admin_category"] = category
+    amount = amount_map.get(data)
+    context.user_data["admin_coupon_amount"] = amount
     
-    await query.message.reply_text(
-        f"Send codes for **{category}** category (Space separated or New lines).",
-        parse_mode="Markdown"
+    await query.edit_message_text(
+        f"👑 <b>Add {amount} ₪ Coupons</b>\n\n"
+        "Please send coupon codes (one per line):\n\n"
+        "<i>Example:</i>\n"
+        "<code>SHEIN500ABC</code>\n"
+        "<code>SHEIN500XYZ</code>\n\n"
+        "Send /cancel to cancel.",
+        parse_mode="HTML"
     )
     
-    return "WAITING_CODES"
+    return WAITING_CODES
 
 async def admin_receive_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    category = context.user_data.get("admin_category")
-    if not category:
+    """Receive coupon codes from admin"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
         return ConversationHandler.END
     
-    raw_text = update.message.text
-    if not raw_text:
-        await update.message.reply_text("❌ No codes provided!")
-        return ConversationHandler.END
+    amount = context.user_data.get("admin_coupon_amount", 500)
+    text = update.message.text
     
-    codes = raw_text.replace('\n', ' ').split(' ')
-    codes = [c.strip() for c in codes if c.strip()]
+    # Split codes by newline
+    codes = text.strip().split('\n')
     
-    added_count = await add_coupons_mongo(category, codes)
+    # Add coupons to database
+    added_count = db.add_coupons(amount, codes)
     
+    # Log admin action
+    db.log_admin_action(user_id, f"add_coupons_{amount}", f"Added {added_count} coupons")
+    
+    # Send confirmation
     await update.message.reply_text(
-        f"✅ Successfully added **{added_count}** coupons to **{category}** category.",
-        parse_mode="Markdown"
+        f"✅ <b>Successfully added {added_count} coupon(s)!</b>\n\n"
+        f"💰 Amount: {amount} ₪\n"
+        f"🎟 Added: {added_count} codes\n"
+        f"📊 Failed: {len(codes) - added_count} (duplicates)\n\n"
+        "Updated stock:",
+        parse_mode="HTML"
     )
+    
+    # Show updated stock
+    stock = db.get_coupon_stock()
+    stock_message = format_stock_message(stock)
+    await update.message.reply_text(stock_message, parse_mode="HTML")
+    
+    # Log to channel
+    log_message = (
+        f"👑 <b>Admin Action</b>\n\n"
+        f"👤 Admin: {update.effective_user.first_name} (ID: {user_id})\n"
+        f"🎟 Added: {added_count} x {amount} ₪ coupons\n"
+        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+    )
+    await send_log_message(context, log_message)
     
     return ConversationHandler.END
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin stats callback"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
     if user_id not in ADMIN_IDS:
-        await query.answer("❌ Unauthorized!", show_alert=True)
+        await query.edit_message_text("❌ Access denied!")
         return
     
-    # Get stats
-    users_count = await users_collection.count_documents({})
-    coupons_count = await coupons_collection.count_documents({})
+    stats = db.get_stats()
+    stock = db.get_coupon_stock()
     
-    stock_500 = await get_stock_count("500")
-    stock_1000 = await get_stock_count("1000")
-    stock_2000 = await get_stock_count("2000")
-    stock_4000 = await get_stock_count("4000")
-    
-    total_balance = await users_collection.aggregate([
-        {"$group": {"_id": None, "total": {"$sum": "$balance"}}}
-    ]).to_list(length=1)
-    
-    total_balance = total_balance[0]["total"] if total_balance else 0
-    
-    # Admin list
-    admin_list = "\n".join([f"  • `{admin_id}`" for admin_id in ADMIN_IDS])
-    
-    # FSub channels list
-    fsub_list = "\n".join([f"  • `{channel_id}`" for channel_id in FSUB_CHANNEL_IDS])
-    
-    stats_text = (
-        "📊 **Bot Statistics**\n\n"
-        f"👥 Total Users: `{users_count}`\n"
-        f"💎 Total Diamonds: `{total_balance}`\n\n"
-        "🎟 **Coupon Stock**\n"
-        f"  500: `{stock_500}`\n"
-        f"  1000: `{stock_1000}`\n"
-        f"  2000: `{stock_2000}`\n"
-        f"  4000: `{stock_4000}`\n\n"
-        "👑 **Admins**\n"
-        f"{admin_list}\n\n"
-        "📢 **Force Subscribe Channels**\n"
-        f"{fsub_list}"
+    message = (
+        "📊 <b>Bot Statistics</b>\n\n"
+        f"👥 <b>Total Users:</b> {stats['total_users']}\n"
+        f"🟢 <b>Active Today:</b> {stats['active_today']}\n"
+        f"🎟 <b>Total Coupons:</b> {stats['total_coupons']}\n"
+        f"✅ <b>Used Coupons:</b> {stats['used_coupons']}\n"
+        f"🔄 <b>Available:</b> {stats['available_coupons']}\n\n"
+        "<b>Coupon Stock:</b>\n"
+        f"• 500 ₪: {stock['500']}\n"
+        f"• 1000 ₪: {stock['1000']}\n"
+        f"• 2000 ₪: {stock['2000']}\n"
+        f"• 4000 ₪: {stock['4000']}\n\n"
+        f"<i>Last updated: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}</i>"
     )
     
-    await query.message.reply_text(stats_text, parse_mode="Markdown")
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back to Admin Panel", callback_data="back_to_admin")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_stats")]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_reload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin reload callback"""
+    query = update.callback_query
+    await query.answer("✅ Data reloaded!", show_alert=True)
+
+async def back_to_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle back to admin panel callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Return to admin panel
+    await admin_command(update, context)
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel admin operation"""
     await update.message.reply_text("❌ Operation cancelled.")
     return ConversationHandler.END
 
-# ================= WEB SERVER =================
-async def web_start():
-    app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Bot Alive"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', PORT).start()
-    logger.info(f"🌐 Web server started on port {PORT}")
-
-# ================= MAIN BOT SETUP =================
-async def post_init(app: Application):
-    """Run after bot is initialized"""
-    await web_start()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle regular messages (for button texts)"""
+    text = update.message.text
     
-    try:
-        await client.admin.command('ping')
-        logger.info("✅ Connected to MongoDB")
-        
-        bot_username = (await app.bot.get_me()).username
-        await app.bot.send_message(
-            LOG_CHANNEL_ID,
-            f"🟢 **Bot Restarted & Online**\n🤖 Bot: @{bot_username}\n📅 Time: {get_ist_time()}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"MongoDB connection error: {e}")
+    if text == "🔗 My Link":
+        await handle_my_link(update, context)
+    elif text == "💎 Balance":
+        await handle_balance(update, context)
+    elif text == "🎟 Coupon Stock":
+        await handle_stock(update, context)
+    elif text == "💸 Withdraw":
+        await handle_withdraw(update, context)
+    elif text == "👑 Admin Panel":
+        await admin_command(update, context)
 
-# Export the start function for runner.py
+# ================= MAIN FUNCTION =================
 async def start_bot4():
     """Start Bot 4 with python-telegram-bot"""
     # Build application
-    app = ApplicationBuilder() \
+    app = Application.builder() \
         .token(BOT4_TOKEN) \
-        .post_init(post_init) \
         .build()
     
     # Add conversation handlers for admin
@@ -689,29 +827,29 @@ async def start_bot4():
             CallbackQueryHandler(admin_add_coupons, pattern="^admin_add_4000$")
         ],
         states={
-            "WAITING_CODES": [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_codes)]
+            WAITING_CODES: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_codes)]
         },
-        fallbacks=[CommandHandler("cancel", admin_cancel)]
+        fallbacks=[CommandHandler("cancel", admin_cancel)],
+        allow_reentry=True
     )
     
     # Add all handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    
+    # Callback query handlers
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(handle_redeem, pattern="^redeem_"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: u.answer("✅ Data reloaded!", show_alert=True), pattern="^admin_reload$"))
+    app.add_handler(CallbackQueryHandler(admin_reload_callback, pattern="^admin_reload$"))
+    app.add_handler(CallbackQueryHandler(back_to_main_callback, pattern="^back_to_main$"))
+    app.add_handler(CallbackQueryHandler(back_to_admin_callback, pattern="^back_to_admin$"))
+    
+    # Admin conversation handler
     app.add_handler(admin_conv_handler)
     
-    # Add message handlers
-    app.add_handler(MessageHandler(filters.Regex("^🔗 My Link$"), handle_my_link))
-    app.add_handler(MessageHandler(filters.Regex("^💎 Balance$"), handle_balance))
-    app.add_handler(MessageHandler(filters.Regex("^🎟 Coupon Stock$"), handle_stock))
-    app.add_handler(MessageHandler(filters.Regex("^💸 Withdraw$"), handle_withdraw))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_captcha))
-    
-    # Start backup job
-    asyncio.create_task(backup_job())
+    # Message handlers for buttons
+    app.add_handler(MessageHandler(filters.Regex("^(🔗 My Link|💎 Balance|🎟 Coupon Stock|💸 Withdraw|👑 Admin Panel)$"), handle_message))
     
     # Initialize and start
     await app.initialize()
@@ -721,11 +859,23 @@ async def start_bot4():
     logger.info(f"👑 Admins: {len(ADMIN_IDS)} users")
     logger.info(f"📢 Force Sub Channels: {len(FSUB_CHANNEL_IDS)} channels")
     
+    # Get bot info
+    bot_info = await app.bot.get_me()
+    logger.info(f"🤖 Bot Username: @{bot_info.username}")
+    
+    # Send startup message to log channel
+    startup_message = (
+        "🚀 <b>Bot Started Successfully!</b>\n\n"
+        f"🤖 Bot: @{bot_info.username}\n"
+        f"👑 Admins: {len(ADMIN_IDS)}\n"
+        f"📢 Channels: {len(FSUB_CHANNEL_IDS)}\n"
+        f"🕒 Time: {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+    )
+    await send_log_message(app, startup_message)
+    
     # Start polling
     await app.updater.start_polling()
-    
-    # Run forever
-    await asyncio.Event().wait()
 
-# ================= EXPORT FOR RUNNER =================
-__all__ = ['start_bot4']
+async def post_init(application: Application):
+    """Post initialization"""
+    logger.info("✅ Bot initialized successfully")
