@@ -34,7 +34,7 @@ PORT = int(os.getenv("PORT", "8080"))
 
 # Multiple Admins and Force Subscribe Channels
 ADMIN_IDS = [5298223577,2120581499]  # Add more admin IDs here
-FSUB_CHANNEL_IDS = [-1002114224580,-1003627956964,-1003680807119,-1002440964326,-1003838483796]  # Add more channel IDs here
+FSUB_CHANNEL_IDS = [-1002114224580,-1003627956964,-1003680807119,-1002440964326,-1003541438177]  # Add more channel IDs here
 
 # Welcome Image
 WELCOME_IMAGE = "https://raw.githubusercontent.com/DevXShiva/Save-Restricted-Bot/refs/heads/main/logo.png"
@@ -704,6 +704,7 @@ async def start_bot4():
 
     # ================= EXPORT FOR RUNNER =================
     __all__ = ['start_bot4']
+
 
 
 
