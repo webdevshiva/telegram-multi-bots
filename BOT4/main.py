@@ -37,8 +37,8 @@ ADMIN_IDS = [5298223577, 2120581499]  # Add more admin IDs here
 FSUB_CHANNEL_IDS = [-1002114224580, -1003627956964, -1003680807119, -1002440964326, -1003541438177]  # Add more channel IDs here
 
 # Welcome Image
-WELCOME_IMAGE = "https://raw.githubusercontent.com/DevXShiva/Save-Restricted-Bot/refs/heads/main/logo.png"
-DEV_CREDITS = "\n\n\n\n👨‍💻 *Developed by:* [VoidXdevs](https://t.me/devXvoid)"
+WELCOME_IMAGE = ""
+DEV_CREDITS = "\n\n\[VoidXdevs](https://t.me/devXvoid)"
 
 # ================= MONGODB SETUP =================
 client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=50, minPoolSize=10)
@@ -432,8 +432,7 @@ async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{DEV_CREDITS}"
             )
             
-            await update.message.reply_photo(
-                photo=WELCOME_IMAGE,
+            await update.message.reply_text(
                 caption=caption,
                 parse_mode="Markdown"
             )
@@ -963,3 +962,4 @@ async def start_bot4():
 
 # ================= EXPORT FOR RUNNER =================
 __all__ = ['start_bot4']
+
