@@ -108,7 +108,7 @@ def restart_bots_route():
 # ================= BOT MANAGEMENT =================
 def start_bots_background():
     """Start all bots in background thread"""
-    global bots_running, bot_thread
+    global bots_running, bot_thread, bot_tasks
     
     if not BOTS_AVAILABLE or bots_running:
         return
@@ -119,18 +119,18 @@ def start_bots_background():
         async def run_all_bots():
             try:
                 print("🚀 Starting all bots...")
+                
+                # Store tasks globally
+                global bot_tasks
                 tasks = [
                     asyncio.create_task(start_bot1()),
                     asyncio.create_task(start_bot2()),
                     asyncio.create_task(start_bot3()),
                     asyncio.create_task(start_bot4())
                 ]
+                bot_tasks = tasks
                 
-                # Store tasks globally
-                import asyncio
-                loop = asyncio.get_event_loop()
-                
-                # Run forever
+                # Run all tasks
                 await asyncio.gather(*tasks, return_exceptions=True)
                 
             except asyncio.CancelledError:
@@ -138,8 +138,10 @@ def start_bots_background():
             except Exception as e:
                 print(f"❌ Bot Error: {e}")
         
-        # Run in existing event loop
-        asyncio.run(run_all_bots())
+        # Run in new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_all_bots())
     
     # Start in separate thread
     bot_thread = threading.Thread(target=run_all_bots_sync, daemon=True)
@@ -174,7 +176,13 @@ def run_old_server():
         print(f"❌ Old server error: {e}")
 
 # ================= MAIN FUNCTION =================
-async def main():
+def run_flask_server():
+    """Run Flask server with waitress"""
+    import waitress
+    print(f"🌐 Flask server starting on port {PORT}...")
+    waitress.serve(flask_app, host='0.0.0.0', port=PORT)
+
+def main():
     print("=" * 50)
     print("🤖 Telegram Multi-Bots Runner")
     print("=" * 50)
@@ -194,11 +202,8 @@ async def main():
     else:
         print("⏸️  Auto-start disabled, use /start endpoint")
     
-    # Run Flask app
-    import waitress
-    print(f"🌐 Flask server starting on port {PORT}...")
-    waitress.serve(flask_app, host='0.0.0.0', port=PORT)
+    # Run Flask app (blocking)
+    run_flask_server()
 
 if __name__ == "__main__":
-    # Run the main async function
-    asyncio.run(main())
+    main()
