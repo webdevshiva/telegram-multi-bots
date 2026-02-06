@@ -38,7 +38,7 @@ FSUB_CHANNEL_IDS = [-1002114224580, -1003627956964, -1003680807119, -10024409643
 
 # Welcome Image
 WELCOME_IMAGE = ""
-DEV_CREDITS = "\n\n\[VoidXdevs](https://t.me/devXvoid)"
+DEV_CREDITS = "\n\n\n\n👨‍💻 *Developed by:* [VoidXdevs](https://t.me/devXvoid)"
 
 # ================= MONGODB SETUP =================
 client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=50, minPoolSize=10)
@@ -429,7 +429,6 @@ async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = (
                 "👋 Welcome to SHEIN Refer Coupon Bot!\n"
                 "Invite friends & earn rewards.\n"
-                f"{DEV_CREDITS}"
             )
             
             await update.message.reply_text(
@@ -472,7 +471,7 @@ async def handle_my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 **Referral Stats**\n"
         f"• Total Referrals: {referral_count}\n"
         f"• Earn 1 💎 per referral\n\n"
-        f"Invite friends using above link!\n{DEV_CREDITS}"
+        f"Invite friends using above link!"
     )
     
     keyboard = [[InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={link}")]]
@@ -962,4 +961,5 @@ async def start_bot4():
 
 # ================= EXPORT FOR RUNNER =================
 __all__ = ['start_bot4']
+
 
